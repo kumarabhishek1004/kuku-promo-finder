@@ -16,10 +16,30 @@ Each promo should:
 
 1. Parse screenplay files.
 2. Detect dramatic events.
-3. Generate multiple promo candidates.
-4. Validate timestamps and duration.
-5. Score and rank promos.
-6. Export ranked results.
+3. Generate promo candidates.
+4. Score candidates.
+5. Rank candidates.
+6. Validate cuts and group overlapping windows into promo families.
+
+## Run the application
+
+Install the Python dependencies, then start the Streamlit app from the project root:
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+The app reads the generated files in `outputs/`:
+
+- `validated_promos.json`
+- `validation_summary.json`
+- `human_review_queue.json`
+- `ranked_promos.json`, used only when the validated file cannot be read
+
+The interface has five sections: Dashboard, Top Promos, Human Review, All Candidates, and Review Decisions. A reviewer can mark a candidate APPROVED, REJECTED, or HOLD and add an optional comment. Those choices are stored in `outputs/reviewer_decisions.json`. The app does not rewrite the ranking or validation files, and priority does not set a decision.
+
+The source files contain screenplay text and timestamps. The app does not play video.
 
 ## Project Structure
 
@@ -31,4 +51,4 @@ Each promo should:
 
 ## Technology
 
-Python, Streamlit, Pandas, and interchangeable LLM providers.
+Python, Streamlit, and Pandas.
