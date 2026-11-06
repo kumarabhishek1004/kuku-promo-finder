@@ -44,35 +44,22 @@ The current pipeline uses deterministic code and rule-based scoring. It does not
 ```text
 kuku-promo-finder/
 │
-├── data/
-│   └── episodes/              # Input screenplay files
-│
 ├── src/
-│   ├── parser.py              # Screenplay parsing
-│   ├── event_detector.py      # Dramatic event detection
-│   ├── promo_generator.py     # Promo candidate generation
-│   ├── promo_scorer.py        # Candidate scoring
-│   ├── ranking.py             # Ranking and duplicate handling
-│   ├── validator.py           # Validation and promo family grouping
-│   ├── frontend_data.py       # Dashboard data preparation
-│   └── llm_client.py          # Model integration interface
+│   ├── parser.py
+│   ├── event_detector.py
+│   ├── promo_generator.py
+│   ├── promo_scorer.py
+│   ├── ranking.py
+│   ├── validator.py
+│   ├── frontend_data.py
+│   └── llm_client.py
 │
-├── outputs/
-│   ├── parsed_episodes.json
-│   ├── promo_candidates.json
-│   ├── scored_candidates.json
-│   ├── ranked_promos.json
-│   ├── ranked_promos.csv
-│   ├── validated_promos.json
-│   ├── validation_summary.json
-│   ├── human_review_queue.json
-│   └── reviewer_decisions.json
+├── tests/
 │
-├── tests/                     # Automated tests
-│
-├── app.py                     # Streamlit application entry point
-├── config.py                  # Configuration
-├── requirements.txt           # Python dependencies
+├── app.py
+├── config.py
+├── requirements.txt
+├── .gitignore
 └── README.md
 ```
 
