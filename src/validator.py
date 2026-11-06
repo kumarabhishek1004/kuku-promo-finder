@@ -80,10 +80,13 @@ def validate_candidates(payload: dict | list | None, parsed: dict | None = None)
         candidate.pop("_tokens", None)
         candidate["validation"] = validation
         validated.append(candidate)
+    families = _assign_families(validated)
+    queue = _build_inspection_queue(families)
     return {
         "candidates": validated,
         "duplicate_pairs": pairs,
-        "summary": _summary(validated, pairs, error),
+        "inspection_queue": queue,
+        "summary": _summary(validated, pairs, families, queue, error),
     }
 
 
@@ -99,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     argument_parser.add_argument("--parsed", default=str(root / "outputs" / "parsed_episodes.json"))
     argument_parser.add_argument("--output", default=str(root / "outputs" / "validated_promos.json"))
     argument_parser.add_argument("--summary", default=str(root / "outputs" / "validation_summary.json"))
+    argument_parser.add_argument("--queue", default=str(root / "outputs" / "human_review_queue.json"))
     args = argument_parser.parse_args(argv)
     ranked_path = Path(args.ranked)
     if not ranked_path.is_file():
@@ -108,20 +112,26 @@ def main(argv: list[str] | None = None) -> int:
     result = validate_candidates(load_json(ranked_path), parsed)
     output = Path(args.output)
     summary_path = Path(args.summary)
+    queue_path = Path(args.queue)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     summary_path.write_text(
         json.dumps(result["summary"], ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    queue_path.write_text(
+        json.dumps(result["inspection_queue"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     summary = result["summary"]
     print(
         f"Validated {summary['candidate_count']} candidates. "
-        f"Duplicate pairs {summary['duplicate_pair_count']}. "
-        f"Human review {summary['human_review_count']}."
+        f"Families {summary['family_count']}. "
+        f"Inspection queue {summary['inspection_queue_count']}."
     )
     print(f"Wrote {output}")
     print(f"Wrote {summary_path}")
+    print(f"Wrote {queue_path}")
     return 0
 
 
@@ -135,16 +145,28 @@ def _validate_one(candidate: dict, following: dict | None) -> dict:
     flags.extend(clarity["flags"])
     if _overlaps_equal_or_stronger(candidate):
         flags.append("duplicate_substantial_overlap")
-    review_reasons = list(flags)
+    reasons = _priority_reasons(candidate, opening, ending, clarity)
+    priority = _highest_priority(reasons)
     return {
         "flags": flags,
+        "priority": priority,
+        "priority_reasons": reasons,
         "duplicate_warnings": list(candidate.get("duplicate_warnings") or []),
         "opening": opening,
         "ending": ending,
         "clarity": clarity,
+        "family": None,
+        "inspection": {
+            "in_queue": False,
+            "role": None,
+            "covered_by": None,
+            "same_ending_candidate_ids": [],
+        },
         "human_review": {
-            "recommended": bool(review_reasons),
-            "reasons": review_reasons,
+            "recommended": False,
+            "priority": priority,
+            "advisory": priority == "medium",
+            "reasons": [reason["code"] for reason in reasons if reason["level"] == priority],
             "note": _METHOD_NOTE,
         },
         "scores_unchanged": True,
@@ -414,6 +436,8 @@ def _followup_record(following: dict | None, last_dialogue: dict | None) -> dict
         "start_ms": following.get("start_ms"),
         "text": following.get("text"),
         "lexical_score": follow_score,
+        "last_lexical_score": last_score,
+        "lexical_score_difference": follow_score - last_score,
         "evidence": _evidence(following, "Next dialogue or action starts within 3 seconds after the cut."),
     }
 
@@ -585,31 +609,333 @@ def _rows(payload: dict | list | None) -> tuple[list, str | None]:
     return rows, None
 
 
-def _summary(candidates: list[dict], pairs: list[dict], error: str | None) -> dict:
+_LEVEL_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+_HARD_CALLBACKS = {"again", "last time", "as before", "as i said", "like before", "that night"}
+_RHETORICAL_CALLBACKS = {"you know", "remember"}
+
+
+def _reason(code: str, level: str, status: str, text: str) -> dict:
+    return {"code": code, "level": level, "status": status, "review_reason": text}
+
+
+def _priority_reasons(candidate: dict, opening: dict, ending: dict, clarity: dict) -> list[dict]:
+    """Separate confirmed cut defects from heuristic warnings and informational notes."""
+    reasons = []
+    final = ending.get("final_text") or ""
+    follow = ending.get("following_line") or {}
+    next_line = _spoken(follow.get("text") or "")
+    continued = bool(follow.get("present") and _starts_mid_sentence(next_line))
+    split = _ends_mid_sentence(final) and continued
+    words = _core_words(final)
+    if split:
+        reasons.append(
+            _reason(
+                "sentence_split",
+                "high",
+                "confirmed",
+                "The final line is cut off and the next screenplay line continues it.",
+            )
+        )
+    if "ending_resolves_or_explains" in ending.get("flags", []):
+        reasons.append(
+            _reason(
+                "ending_explains",
+                "high",
+                "heuristic",
+                "Phrase match suggests the ending states the answer. This is a warning, not proof the promo fails.",
+            )
+        )
+    if follow.get("heuristic_stronger") and final.rstrip().endswith("?") and not split:
+        reasons.append(
+            _reason(
+                "question_then_stronger_line",
+                "high",
+                "heuristic",
+                "The ending is a question and the next cue has a higher keyword score. This is a warning, not proof the cut is wrong.",
+            )
+        )
+    difference = follow.get("lexical_score_difference")
+    if (
+        follow.get("present")
+        and not split
+        and not final.rstrip().endswith("?")
+        and isinstance(difference, int)
+        and difference >= 5
+    ):
+        reasons.append(
+            _reason(
+                "later_line_much_hotter",
+                "medium",
+                "heuristic",
+                "The next cue scores at least 5 keyword points higher. This is a warning, not a confirmed defect.",
+            )
+        )
+    if "opening_no_meaningful_cue" in opening.get("flags", []):
+        reasons.append(
+            _reason(
+                "thin_opening",
+                "medium",
+                "heuristic",
+                "The first 3 seconds lack a line of at least two words or an action of at least 30 characters.",
+            )
+        )
+    if "opening_mid_sentence" in opening.get("flags", []):
+        reasons.append(
+            _reason(
+                "opening_ellipsis",
+                "medium",
+                "heuristic",
+                "The first spoken line starts with an ellipsis. Judge the rest of the clip before treating this as a bad opening.",
+            )
+        )
+    if _ends_mid_sentence(final) and follow.get("present") and not continued and len(words) > 2:
+        reasons.append(
+            _reason(
+                "long_ellipsis_new_sentence",
+                "medium",
+                "heuristic",
+                "A longer ending ellipsis is followed by a new sentence. This may be a pause rather than a broken sentence.",
+            )
+        )
+    phrases = set(clarity.get("previous_event_phrases") or [])
+    if phrases & _HARD_CALLBACKS:
+        reasons.append(
+            _reason(
+                "hard_callback",
+                "medium",
+                "heuristic",
+                "The clip uses a callback such as 'again' or 'last time'. Keyword presence is not story understanding.",
+            )
+        )
+    if phrases & _RHETORICAL_CALLBACKS:
+        reasons.append(
+            _reason(
+                "rhetorical_callback",
+                "low",
+                "informational",
+                "'You know' or 'remember' appears. This is informational and does not require review.",
+            )
+        )
+    if "unexplained_pronouns" in clarity.get("flags", []):
+        reasons.append(
+            _reason(
+                "unexplained_pronouns",
+                "low",
+                "informational",
+                "Pronouns are common in this clip. The count does not show that the scene is unclear.",
+            )
+        )
+    if _ends_mid_sentence(final) and 0 < len(words) <= 2:
+        reasons.append(
+            _reason(
+                "short_address_ellipsis",
+                "low",
+                "informational",
+                "The ending is a one- or two-word address or exclamation with an ellipsis, such as a name.",
+            )
+        )
+    if "opening_depends_on_prior_event" in opening.get("flags", []):
+        reasons.append(
+            _reason(
+                "opening_conjunction",
+                "low",
+                "informational",
+                "The opening starts with Then, But, So, or Again. That is not a failure when the rest of the clip can be read.",
+            )
+        )
+    if candidate.get("duplicate_warnings"):
+        reasons.append(
+            _reason(
+                "duplicate_overlap",
+                "low",
+                "informational",
+                "This clip overlaps another window in the same episode. It stays in its promo family and is not discarded.",
+            )
+        )
+    return reasons
+
+
+def _highest_priority(reasons: list[dict]) -> str:
+    if not reasons:
+        return "none"
+    return max(reasons, key=lambda reason: _LEVEL_RANK[reason["level"]])["level"]
+
+
+def _core_words(spoken: str) -> list[str]:
+    text = spoken.replace("...", " ").replace("\u2026", " ").replace("\u2014", " ").replace("—", " ")
+    return [word for word in text.split() if word]
+
+
+def _assign_families(candidates: list[dict]) -> list[list[dict]]:
+    """Greedy seeds. A clip joins the first same-episode seed it substantially overlaps."""
+    ordered = sorted(candidates, key=_family_sort_key)
+    families: list[list[dict]] = []
+    for candidate in ordered:
+        placed = False
+        for group in families:
+            seed = group[0]
+            if seed.get("episode_number") != candidate.get("episode_number"):
+                continue
+            iou, shorter_ratio, _intersection = _overlap_metrics(seed, candidate)
+            if iou >= IOU_REVIEW or shorter_ratio >= SHORTER_OVERLAP_REVIEW:
+                group.append(candidate)
+                placed = True
+                break
+        if not placed:
+            families.append([candidate])
+    counters: dict[object, int] = {}
+    for group in families:
+        episode = group[0].get("episode_number")
+        counters[episode] = counters.get(episode, 0) + 1
+        family_id = _family_id(episode, counters[episode])
+        seed_id = group[0].get("candidate_id")
+        for member in group:
+            member["validation"]["family"] = {
+                "family_id": family_id,
+                "seed_candidate_id": seed_id,
+                "is_seed": member.get("candidate_id") == seed_id,
+                "member_count": len(group),
+                "high_representative_id": None,
+            }
+    return families
+
+
+def _family_sort_key(candidate: dict) -> tuple:
+    overall = (candidate.get("scores") or {}).get("overall") if isinstance(candidate.get("scores"), dict) else None
+    score = overall if isinstance(overall, (int, float)) else -1
+    episode = candidate.get("episode_number")
+    episode_key = episode if isinstance(episode, int) else 10**9
+    start = candidate.get("start_ms")
+    start_key = start if isinstance(start, int) else 10**12
+    return (-score, episode_key, start_key, candidate.get("candidate_id") or "")
+
+
+def _family_id(episode: object, index: int) -> str:
+    if isinstance(episode, int):
+        return f"ep{episode:02d}-f{index:03d}"
+    return f"ep-{episode}-f{index:03d}"
+
+
+def _build_inspection_queue(families: list[list[dict]]) -> dict:
+    """One inspection per distinct high-priority ending inside each family."""
+    items = []
+    covered = []
+    for group in families:
+        high_members = [member for member in group if member["validation"]["priority"] == "high"]
+        if not high_members:
+            continue
+        buckets: dict[str, list[dict]] = {}
+        for member in high_members:
+            buckets.setdefault(_final_text(member), []).append(member)
+        representative = max(high_members, key=_inspection_sort_key)
+        representative_final = _final_text(representative)
+        family = representative["validation"]["family"]
+        for member in group:
+            member["validation"]["family"]["high_representative_id"] = representative.get("candidate_id")
+        for final, members in buckets.items():
+            selected = max(members, key=_inspection_sort_key)
+            others = [member.get("candidate_id") for member in members if member is not selected]
+            role = "representative" if final == representative_final else "alternative"
+            inspection = selected["validation"]["inspection"]
+            inspection["in_queue"] = True
+            inspection["role"] = role
+            inspection["same_ending_candidate_ids"] = others
+            selected["validation"]["human_review"]["recommended"] = True
+            item = {
+                "candidate_id": selected.get("candidate_id"),
+                "episode_number": selected.get("episode_number"),
+                "family_id": family["family_id"],
+                "family_seed_id": family["seed_candidate_id"],
+                "role": role,
+                "priority": "high",
+                "reasons": [reason for reason in selected["validation"]["priority_reasons"] if reason["level"] == "high"],
+                "final_text": final,
+                "start": selected.get("start"),
+                "end": selected.get("end"),
+                "start_ms": selected.get("start_ms"),
+                "end_ms": selected.get("end_ms"),
+                "scores": dict(selected.get("scores") or {}),
+                "same_ending_candidate_ids": others,
+            }
+            items.append(item)
+            for member in members:
+                if member is selected:
+                    continue
+                member["validation"]["inspection"]["covered_by"] = selected.get("candidate_id")
+                member["validation"]["inspection"]["same_ending_candidate_ids"] = [
+                    selected.get("candidate_id")
+                ]
+                covered.append(
+                    {
+                        "candidate_id": member.get("candidate_id"),
+                        "covered_by": selected.get("candidate_id"),
+                        "family_id": family["family_id"],
+                        "final_text": final,
+                    }
+                )
+    items.sort(key=lambda item: (item["episode_number"] if isinstance(item["episode_number"], int) else 10**9, item["family_id"], 0 if item["role"] == "representative" else 1, item["candidate_id"] or ""))
+    for position, item in enumerate(items, start=1):
+        item["queue_position"] = position
+    representatives = sum(1 for item in items if item["role"] == "representative")
+    return {
+        "inspection_count": len(items),
+        "representative_count": representatives,
+        "alternative_count": len(items) - representatives,
+        "same_ending_not_separately_queued": covered,
+        "items": items,
+        "note": "Queue size is calculated from the input. Candidates that share a final line stay recorded and are not deleted.",
+    }
+
+
+def _inspection_sort_key(candidate: dict) -> tuple:
+    overall = (candidate.get("scores") or {}).get("overall") if isinstance(candidate.get("scores"), dict) else None
+    score = overall if isinstance(overall, (int, float)) else -1
+    start = candidate.get("start_ms")
+    start_key = start if isinstance(start, int) else 10**12
+    return (score, -start_key, candidate.get("candidate_id") or "")
+
+
+def _final_text(candidate: dict) -> str:
+    return candidate.get("validation", {}).get("ending", {}).get("final_text") or ""
+
+
+def _summary(candidates: list[dict], pairs: list[dict], families: list[list[dict]], queue: dict, error: str | None) -> dict:
     flag_counts: dict[str, int] = {}
-    review = []
+    priority_counts = {"high": 0, "medium": 0, "low": 0, "none": 0}
+    high_families = 0
+    for group in families:
+        if any(member["validation"]["priority"] == "high" for member in group):
+            high_families += 1
+    shortlist = []
     for candidate in candidates:
         validation = candidate.get("validation") or {}
+        priority_counts[validation.get("priority") or "none"] += 1
         for flag in validation.get("flags") or []:
             flag_counts[flag] = flag_counts.get(flag, 0) + 1
-        human = validation.get("human_review") or {}
-        if human.get("recommended"):
-            review.append(
+        if candidate.get("shortlist_rank"):
+            shortlist.append(
                 {
                     "candidate_id": candidate.get("candidate_id"),
                     "episode_number": candidate.get("episode_number"),
-                    "start": candidate.get("start"),
-                    "end": candidate.get("end"),
                     "shortlist_rank": candidate.get("shortlist_rank"),
-                    "reasons": human.get("reasons") or [],
+                    "priority": validation.get("priority"),
+                    "in_inspection_queue": (validation.get("inspection") or {}).get("in_queue"),
+                    "family_id": (validation.get("family") or {}).get("family_id"),
+                    "reasons": (validation.get("human_review") or {}).get("reasons") or [],
                 }
             )
-    shortlist = [item for item in review if item.get("shortlist_rank")]
-    shortlist_ids = {item["candidate_id"] for item in candidates if item.get("shortlist_rank")}
+    shortlist_ids = {item["candidate_id"] for item in shortlist}
     return {
         "candidate_count": len(candidates),
         "duplicate_pair_count": len(pairs),
-        "human_review_count": len(review),
+        "priority_counts": priority_counts,
+        "family_count": len(families),
+        "high_priority_family_count": high_families,
+        "inspection_queue_count": queue["inspection_count"],
+        "representative_count": queue["representative_count"],
+        "alternative_cut_count": queue["alternative_count"],
+        "same_ending_not_separately_queued_count": len(queue["same_ending_not_separately_queued"]),
+        "human_review_count": queue["inspection_count"],
         "flag_counts": flag_counts,
         "shortlist_duplicate_pairs": [
             pair
@@ -622,6 +948,7 @@ def _summary(candidates: list[dict], pairs: list[dict], error: str | None) -> di
             "shorter_overlap_review": SHORTER_OVERLAP_REVIEW,
             "text_similarity_review": TEXT_SIMILARITY_REVIEW,
             "followup_window_ms": FOLLOWUP_WINDOW_MS,
+            "hotter_line_score_difference": 5,
         },
         "limitation": _METHOD_NOTE,
         "errors": [error] if error else [],
