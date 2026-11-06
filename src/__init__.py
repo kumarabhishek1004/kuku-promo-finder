@@ -1,0 +1,1 @@
+"""Kuku Promo Finder package."""
