@@ -31,10 +31,32 @@ TEXT_WITH_PARTIAL_OVERLAP = 0.40
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 _PRONOUN_RE = re.compile(r"\b(?:he|she|her|him|his|hers|they|them|their|it)\b", re.IGNORECASE)
 _PRIOR_RE = re.compile(
-    r"\b(?:then|again|still|as before|as i said|last time|you know|that night)\b",
+    r"\b(?:again|as before|as i said|last time|like before|remember|that night|you know)\b",
     re.IGNORECASE,
 )
+_OPENING_CONTINUATION = ("then ", "but ", "so ", "again ")
 _NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+_NOT_NAMES = {
+    "And",
+    "But",
+    "Her",
+    "His",
+    "How",
+    "She",
+    "The",
+    "Then",
+    "They",
+    "Them",
+    "That",
+    "This",
+    "What",
+    "When",
+    "Where",
+    "Who",
+    "Why",
+    "You",
+    "Your",
+}
 _METHOD_NOTE = (
     "Lexical and timestamp rules only. They do not establish that a promo is emotionally compelling."
 )
@@ -55,6 +77,7 @@ def validate_candidates(payload: dict | list | None, parsed: dict | None = None)
     for candidate in prepared:
         following = _following_cue(candidate, spine)
         validation = _validate_one(candidate, following)
+        candidate.pop("_tokens", None)
         candidate["validation"] = validation
         validated.append(candidate)
     return {
@@ -110,7 +133,7 @@ def _validate_one(candidate: dict, following: dict | None) -> dict:
     flags.extend(opening["flags"])
     flags.extend(ending["flags"])
     flags.extend(clarity["flags"])
-    if candidate.get("duplicate_warnings"):
+    if _overlaps_equal_or_stronger(candidate):
         flags.append("duplicate_substantial_overlap")
     review_reasons = list(flags)
     return {
@@ -142,7 +165,7 @@ def _opening_assessment(candidate: dict) -> dict:
         flags.append("opening_no_meaningful_cue")
     spoken = _spoken(_first_text(cues))
     mid_sentence = _starts_mid_sentence(spoken)
-    depends_on_prior = bool(spoken) and bool(_PRIOR_RE.search(spoken))
+    depends_on_prior = spoken.lower().startswith(_OPENING_CONTINUATION)
     if mid_sentence:
         flags.append("opening_mid_sentence")
     if depends_on_prior:
@@ -183,7 +206,8 @@ def _ending_assessment(candidate: dict, following: dict | None) -> dict:
     if not cues:
         flags.append("ending_no_dialogue_or_action")
     follow = _followup_record(following, last_dialogue)
-    if follow["present"] and (follow["heuristic_stronger"] or mid_sentence or explains):
+    follow_exclamation = bool(follow.get("present") and _spoken(follow.get("text")).rstrip().endswith("!"))
+    if follow["present"] and (follow["heuristic_stronger"] or (explains and follow_exclamation)):
         flags.append("stronger_beat_after_cut")
         evidence.append(follow["evidence"])
     return _assessment(
@@ -206,7 +230,8 @@ def _clarity_assessment(candidate: dict) -> dict:
     pronouns = _PRONOUN_RE.findall(blob)
     names = []
     for line in spoken_lines:
-        names.extend(_NAME_RE.findall(line))
+        remainder = line.split(None, 1)[1] if " " in line else ""
+        names.extend(name for name in _NAME_RE.findall(remainder) if name not in _NOT_NAMES)
     prior_hits = []
     for line in spoken_lines:
         prior_hits.extend(match.group(0).lower() for match in _PRIOR_RE.finditer(line))
@@ -290,9 +315,13 @@ def _attach_duplicate_warnings(candidates: list[dict], pairs: list[dict]) -> Non
             if candidate is None:
                 continue
             other = [item for item in pair["candidate_ids"] if item != candidate_id]
+            other_id = other[0] if other else None
+            other_candidate = by_id.get(other_id) or {}
+            other_scores = other_candidate.get("scores") if isinstance(other_candidate.get("scores"), dict) else {}
             candidate.setdefault("duplicate_warnings", []).append(
                 {
-                    "other_candidate_id": other[0] if other else None,
+                    "other_candidate_id": other_id,
+                    "other_overall": other_scores.get("overall"),
                     "iou": pair["iou"],
                     "shorter_overlap": pair["shorter_overlap"],
                     "text_similarity": pair["text_similarity"],
@@ -301,6 +330,15 @@ def _attach_duplicate_warnings(candidates: list[dict], pairs: list[dict]) -> Non
                     "discarded": False,
                 }
             )
+
+
+def _overlaps_equal_or_stronger(candidate: dict) -> bool:
+    own = (candidate.get("scores") or {}).get("overall") if isinstance(candidate.get("scores"), dict) else None
+    for warning in candidate.get("duplicate_warnings") or []:
+        other = warning.get("other_overall")
+        if own is None or other is None or other >= own:
+            return True
+    return False
 
 
 def _overlap_metrics(left: dict, right: dict) -> tuple[float, float, int]:
@@ -567,12 +605,17 @@ def _summary(candidates: list[dict], pairs: list[dict], error: str | None) -> di
                 }
             )
     shortlist = [item for item in review if item.get("shortlist_rank")]
+    shortlist_ids = {item["candidate_id"] for item in candidates if item.get("shortlist_rank")}
     return {
         "candidate_count": len(candidates),
         "duplicate_pair_count": len(pairs),
         "human_review_count": len(review),
         "flag_counts": flag_counts,
-        "duplicate_pairs": pairs,
+        "shortlist_duplicate_pairs": [
+            pair
+            for pair in pairs
+            if set(pair["candidate_ids"]).issubset(shortlist_ids)
+        ],
         "shortlist_review": sorted(shortlist, key=lambda item: item.get("shortlist_rank") or 0),
         "thresholds": {
             "iou_review": IOU_REVIEW,
